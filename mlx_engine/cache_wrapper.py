@@ -15,7 +15,7 @@ from mlx_engine.utils.prompt_progress_reporter import (
 )
 
 
-PROMPT_PROCESSING_CHUNK_SIZE = 512
+PROMPT_PROCESSING_CHUNK_SIZE = 2048
 
 logger = logging.getLogger(__name__)
 
