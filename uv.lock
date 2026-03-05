@@ -937,6 +937,7 @@ dependencies = [
     { name = "typer-slim" },
     { name = "typing-inspection" },
     { name = "urllib3" },
+    { name = "uvicorn" },
     { name = "xxhash" },
 ]
 
@@ -999,6 +1000,7 @@ requires-dist = [
     { name = "typer-slim", specifier = "==0.21.1" },
     { name = "typing-inspection", specifier = "==0.4.2" },
     { name = "urllib3", specifier = "==2.6.3" },
+    { name = "uvicorn", specifier = ">=0.41.0" },
     { name = "xxhash", specifier = "==3.6.0" },
 ]
 

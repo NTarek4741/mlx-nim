@@ -42,17 +42,21 @@ from api.api_models import (
 # Import utility functions
 from api.api_utils import (
     GenerationStatsCollector,
-    anthropic_stream,
-    anthropic_to_chat_convert,
     chat_render,
     chat_stream,
-    generate_anthropic_output,
-    generate_openai_output,
     generate_output,
     load_and_cache_model,
     model_cache,
+)
+from api.openai_api_utils import (
+    generate_openai_output,
     openai_stream,
     openai_to_chat_convert,
+)
+from api.anthropic_api_utils import (
+    anthropic_stream,
+    anthropic_to_chat_convert,
+    generate_anthropic_output,
 )
 from mlx_engine.generate import create_generator
 from mlx_engine.utils.prompt_progress_reporter import LoggerReporter
