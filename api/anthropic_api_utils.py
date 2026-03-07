@@ -20,7 +20,6 @@ from api.api_models import (
     OllamaMessage,
     OllamaToolCall,
     OllamaToolCallFunction,
-    OpenAIToolCall,
     TextBlockParam,
     Tool,
     ToolResultBlockParam,
@@ -34,23 +33,63 @@ from api.openai_api_utils import image_url_to_base64
 # Anthropic Utility Functions
 # =============================================================================
 
+TOOL_CALL_PREFIXES = ["<tool_call>", "[TOOL_CALLS]"]
 
-def normalize_system_prompt(system: str | list[TextBlockParam] | None) -> str | None:
+
+def parse_tool_calls(text: str) -> tuple[list[AnthropicToolUseBlock] | None, str]:
     """
-    Convert Anthropic system prompt format to plain string.
+    Parse tool calls from generated text, returning native Anthropic tool_use blocks.
+    Mirrors parse_tool() from openai_api_utils but returns (tool_calls, remaining_content)
+    instead of stream chunks, so callers can build Anthropic tool_use content blocks.
+    """
+    if "<tool_call>" in text:
+        function_match = re.search(r'<function=([^>]+)>', text)
+        function_name = function_match.group(1) if function_match else ""
+        params = {}
+        for match in re.finditer(r'<parameter=([^>]+)>([^<]+)</parameter>', text):
+            params[match.group(1)] = match.group(2).strip()
+        remaining = re.sub(r'<tool_call>.*?</tool_call>', '', text, flags=re.DOTALL).strip()
+    elif "[TOOL_CALLS]" in text:
+        function_name = ""
+        params = {}
+        match = re.search(r'\[TOOL_CALLS\](\w+)\[ARGS\](\{.*\})', text, re.DOTALL)
+        if match:
+            function_name = match.group(1)
+            try:
+                params = json.loads(match.group(2))
+            except json.JSONDecodeError:
+                pass
+        remaining = re.sub(r'\[TOOL_CALLS\].*', '', text, flags=re.DOTALL).strip()
+    else:
+        return None, text
 
-    Args:
-        system: Can be None, str, or list of TextBlockParam
+    if not function_name:
+        return None, text
 
-    Returns:
-        Plain string system prompt or None
+    tool_call = AnthropicToolUseBlock(
+        type="tool_use",
+        id=f"toolu_{uuid.uuid4().hex[:24]}",
+        name=function_name,
+        input=params,
+    )
+    return [tool_call], remaining
+
+
+def system_blocks_to_content(system: str | list[TextBlockParam] | None) -> str | list[dict] | None:
+    """
+    Convert Anthropic system prompt to string or ordered list of content blocks.
+    Stable (cache_control) blocks come first to maximize KV cache hits.
     """
     if system is None:
         return None
     if isinstance(system, str):
         return system
-    # List of TextBlockParam - concatenate all text
-    return "\n".join(block.text for block in system)
+    stable = [{"type": "text", "text": b.text} for b in system if b.cache_control]
+    dynamic = [{"type": "text", "text": b.text} for b in system if not b.cache_control]
+    blocks = stable + dynamic
+    if len(blocks) == 1:
+        return blocks[0]["text"]
+    return blocks
 
 
 def anthropic_to_chat_convert(params: MessagesParams) -> ChatRequest:
@@ -61,12 +100,12 @@ def anthropic_to_chat_convert(params: MessagesParams) -> ChatRequest:
     chat_messages = []
 
     # Handle system prompt (Anthropic has it as a separate field)
-    system_str = normalize_system_prompt(params.system)
-    if system_str:
+    system_content = system_blocks_to_content(params.system)
+    if system_content:
         chat_messages.append(
             OllamaMessage(
                 role="system",
-                content=system_str,
+                content=system_content,
             )
         )
 
@@ -218,7 +257,7 @@ def build_anthropic_response(
     stop_reason: str,
     prompt_token_count: int,
     completion_token_count: int,
-    tool_calls: list[OpenAIToolCall] | None = None,
+    tool_calls: list[AnthropicToolUseBlock] | None = None,
     thinking_text: str | None = None,
 ) -> dict:
     """
@@ -234,18 +273,7 @@ def build_anthropic_response(
     if result_text:
         content.append(AnthropicTextBlock(type="text", text=result_text))
     if tool_calls:
-        for tc in tool_calls:
-            args = tc.function.arguments
-            if isinstance(args, str):
-                args = json.loads(args)
-            content.append(
-                AnthropicToolUseBlock(
-                    type="tool_use",
-                    id=tc.id,
-                    name=tc.function.name,
-                    input=args,
-                )
-            )
+        content.extend(tool_calls)
     if not content:
         content.append(AnthropicTextBlock(type="text", text=""))
 
@@ -302,7 +330,7 @@ async def anthropic_stream(
             "usage": {"input_tokens": len(prompt_tokens), "output_tokens": 0},
         },
     }
-    yield f"event: message_startndata: {json.dumps(message_start)}\n\n"
+    yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
 
     # Track state
     block_index = 0  # next content block index to emit
@@ -445,11 +473,8 @@ async def anthropic_stream(
 
             # Emit tool_use blocks
             for tc in tool_calls:
-                args = tc.function.arguments
-                if isinstance(args, str):
-                    args = json.loads(args)
-                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'tool_use', 'id': tc.id, 'name': tc.function.name, 'input': {}}})}\n\n"
-                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'input_json_delta', 'partial_json': json.dumps(args)}})}\n\n"
+                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'tool_use', 'id': tc.id, 'name': tc.name, 'input': {}}})}\n\n"
+                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'input_json_delta', 'partial_json': json.dumps(tc.input)}})}\n\n"
                 yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
                 block_index += 1
 

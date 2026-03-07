@@ -491,7 +491,7 @@ async def chat_render(
             images.extend(msg.images)
             messages_dicts.append({"role": msg.role, "content": content})
         else:
-            # No images - content is just a string
+            # No images - content is a string or structured list of blocks
             msg_dict = {"role": msg.role, "content": msg.content}
             if msg.tool_calls:
                 msg_dict["tool_calls"] = [

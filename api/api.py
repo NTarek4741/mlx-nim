@@ -333,7 +333,7 @@ async def chat_completions(
 
 
 # GET - List models
-@app.get("/api/tags")
+@app.get("/v1/models")
 async def list_models():
     """
     List all available models.
@@ -355,9 +355,13 @@ async def list_models():
         models_dir = "./models"
 
         for org in os.listdir(models_dir):
+            if org.startswith("."):
+                continue
             org_path = os.path.join(models_dir, org)
 
             for model_name in os.listdir(org_path):
+                if model_name.startswith("."):
+                    continue
                 model_path = os.path.join(org_path, model_name)
 
                 # Use Ollama-style naming with :latest tag

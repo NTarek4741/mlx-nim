@@ -22,6 +22,8 @@ from api.api_models import (
     OpenAIMessage,
     OpenAIResponseMessage,
     OpenAISystemMessage,
+    OpenAIFunctionCall,
+    OpenAIFunctionCall,
     OpenAIToolCall,
     OpenAIToolMessage,
     OpenAIUserMessage,
@@ -156,122 +158,6 @@ def image_url_to_base64(url: str) -> str:
     with urlopen(url) as response:
         image_data = response.read()
     return base64.b64encode(image_data).decode("utf-8")
-
-
-def convert_openai_messages(
-    messages: list[OpenAIMessage],
-    tools: list[Tool] | None = None,
-) -> tuple[list[dict], list[str], list[dict] | None]:
-    """
-    Convert OpenAI message format to internal format for chat_template.
-
-    Args:
-        messages: List of OpenAI Message objects
-        tools: Optional list of Tool definitions
-
-    Returns:
-        Tuple of (messages_dicts, images_b64, tools_dicts) where:
-        - messages_dicts: List of dicts ready for apply_chat_template()
-        - images_b64: List of base64-encoded images extracted from content
-        - tools_dicts: List of tool definitions in dict format, or None
-    """
-    messages_dicts = []
-    images_b64 = []
-
-    for msg in messages:
-        if isinstance(msg, OpenAISystemMessage) or (
-            hasattr(msg, "role") and msg.role == "system"
-        ):
-            messages_dicts.append({"role": "system", "content": msg.content})
-
-        elif isinstance(msg, OpenAIUserMessage) or (
-            hasattr(msg, "role") and msg.role == "user"
-        ):
-            if isinstance(msg.content, str):
-                messages_dicts.append({"role": "user", "content": msg.content})
-            else:
-                # List of content parts (multimodal)
-                content_parts = []
-                for part in msg.content:
-                    if isinstance(part, TextContent) or (
-                        hasattr(part, "type") and part.type == "text"
-                    ):
-                        content_parts.append({"type": "text", "text": part.text})
-                    elif isinstance(part, ImageContent) or (
-                        hasattr(part, "type") and part.type == "image_url"
-                    ):
-                        image_idx = len(images_b64)
-                        content_parts.append(
-                            {"type": "image", "image": f"image{image_idx}"}
-                        )
-                        # Extract base64 from URL or data URI
-                        images_b64.append(image_url_to_base64(part.image_url.url))
-
-                # Simplify if only text
-                if len(content_parts) == 1 and content_parts[0].get("type") == "text":
-                    messages_dicts.append(
-                        {"role": "user", "content": content_parts[0]["text"]}
-                    )
-                else:
-                    messages_dicts.append({"role": "user", "content": content_parts})
-
-        elif isinstance(msg, OpenAIAssistantMessage) or (
-            hasattr(msg, "role") and msg.role == "assistant"
-        ):
-            msg_dict = {"role": "assistant", "content": msg.content or ""}
-            # Add tool calls if present
-            if msg.tool_calls:
-                msg_dict["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        },
-                    }
-                    for tc in msg.tool_calls
-                ]
-            messages_dicts.append(msg_dict)
-
-        elif isinstance(msg, OpenAIToolMessage) or (
-            hasattr(msg, "role") and msg.role == "tool"
-        ):
-            messages_dicts.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": msg.tool_call_id,
-                    "content": msg.content,
-                }
-            )
-
-    # Convert tools to dict format
-    tools_dicts = None
-    if tools:
-        tools_dicts = []
-        for tool in tools:
-            tool_dict = {
-                "type": "function",
-                "function": {
-                    "name": tool.function.name,
-                    "description": tool.function.description or "",
-                    "parameters": {
-                        "type": tool.function.parameters.type
-                        if tool.function.parameters
-                        else "object",
-                        "properties": tool.function.parameters.properties
-                        if tool.function.parameters
-                        else {},
-                        "required": tool.function.parameters.required
-                        if tool.function.parameters
-                        else [],
-                    },
-                },
-            }
-            tools_dicts.append(tool_dict)
-
-    return messages_dicts, images_b64, tools_dicts
-
 
 def build_openai_response(
     model: str,
@@ -453,10 +339,28 @@ async def generate_openai_output(
             finish_reason = "stop"
 
     # Parse tool calls from generated text
-    tool_calls, remaining_content = parse_tool_calls(result_text)
-    if tool_calls:
-        finish_reason = "tool_calls"
-        reasoning_content = None  # drop thinking content when returning tool calls
+    tool_calls = None
+    remaining_content = result_text
+    if "<tool_call>" in result_text or "[TOOL_CALLS]" in result_text:
+        chunk_id = f"call_{uuid.uuid4().hex[:24]}"
+        function_name = ""
+        arguments = ""
+        for chunk_str in parse_tool(result_text, params.model, chunk_id, int(time.time())):
+            data = json.loads(chunk_str.removeprefix("data: ").strip())
+            for choice in data.get("choices", []):
+                for tc in choice.get("delta", {}).get("tool_calls", []):
+                    fn = tc.get("function", {})
+                    function_name = function_name or fn.get("name", "")
+                    arguments += fn.get("arguments", "")
+        if function_name:
+            tool_calls = [OpenAIToolCall(
+                id=chunk_id,
+                type="function",
+                function=OpenAIFunctionCall(name=function_name, arguments=arguments),
+            )]
+            remaining_content = ""
+            finish_reason = "tool_calls"
+            reasoning_content = None
 
     return build_openai_response(
         model=params.model,

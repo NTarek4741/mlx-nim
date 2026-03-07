@@ -235,7 +235,7 @@ class OllamaMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"] = Field(
         description="Author of the message"
     )
-    content: str = Field(description="Message text content")
+    content: str | list[dict] = Field(description="Message text content")
     images: list[str] | None = Field(
         default=None,
         description="Optional list of inline images for multimodal models (Base64-encoded image content)",
@@ -653,6 +653,7 @@ class TextBlockParam(BaseModel):
 
     text: str = Field(description="Text content")
     type: Literal["text"]
+    cache_control: dict | None = Field(default=None)
 
 
 class ImageBlockParam(BaseModel):
