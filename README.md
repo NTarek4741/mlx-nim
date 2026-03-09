@@ -265,6 +265,6 @@ mlx-nim is built on top of the following open source projects:
 - [mlx-lm](https://github.com/ml-explore/mlx-lm) — Language model inference on MLX
 - [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) — Vision-language model support
 - [mlx-community](https://huggingface.co/mlx-community) — Pre-quantized MLX model weights
-- [LM Studio](https://lmstudio.ai) — Inspired model management conventions
+- [LM Studio](https://lmstudio.ai) — This project uses MLX Engine for inference 
 - [FastAPI](https://fastapi.tiangolo.com) — HTTP server framework
 
