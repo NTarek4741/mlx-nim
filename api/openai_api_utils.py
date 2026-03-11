@@ -12,6 +12,7 @@ from api.api_models import (
     ChatCompletionResponse,
     ChatRequest,
     Choice,
+    ChoiceLogprobs,
     FunctionDefinition,
     GenerationOptions,
     ImageContent,
@@ -31,7 +32,7 @@ from api.api_models import (
     Tool,
     Usage,
 )
-from api.api_utils import GenerationStatsCollector
+from api.api_utils import GenerationStatsCollector, build_logprobs
 
 
 def openai_to_chat_convert(req: ChatCompletionRequest):
@@ -134,6 +135,8 @@ def openai_to_chat_convert(req: ChatCompletionRequest):
         format=format_value,
         options=options,
         stream=req.stream if req.stream is not None else True,
+        logprobs=req.logprobs or False,
+        top_logprobs=req.top_logprobs or 0,
     )
 
 
@@ -167,6 +170,7 @@ def build_openai_response(
     completion_token_count: int,
     tool_calls: list[OpenAIToolCall] | None = None,
     reasoning_content: str | None = None,
+    logprobs: ChoiceLogprobs | None = None,
 ) -> dict:
     """
     Build OpenAI ChatCompletionResponse from generation results.
@@ -187,6 +191,7 @@ def build_openai_response(
                     tool_calls=tool_calls,
                 ),
                 finish_reason=finish_reason,
+                logprobs=logprobs,
             )
         ],
         usage=Usage(
@@ -317,10 +322,19 @@ async def generate_openai_output(
     """
     result_text = ""
     generation_result = None
+    logprobs_list = [] if params.logprobs else None
 
     for generation_result in generator:
         result_text += generation_result.text
         stats_collector.add_tokens(generation_result.tokens)
+        if logprobs_list is not None and generation_result.top_logprobs:
+            logprobs_list.extend(
+                build_logprobs(
+                    generation_result.tokens,
+                    generation_result.top_logprobs,
+                    params.top_logprobs or 1,
+                )
+            )
 
     # Extract thinking blocks as reasoning_content
     reasoning_content = None
@@ -362,6 +376,7 @@ async def generate_openai_output(
             finish_reason = "tool_calls"
             reasoning_content = None
 
+    choice_logprobs = ChoiceLogprobs(content=logprobs_list) if logprobs_list else None
     return build_openai_response(
         model=params.model,
         result_text=remaining_content,
@@ -370,4 +385,5 @@ async def generate_openai_output(
         completion_token_count=stats_collector.total_tokens,
         tool_calls=tool_calls,
         reasoning_content=reasoning_content,
+        logprobs=choice_logprobs,
     )

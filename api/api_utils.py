@@ -8,13 +8,9 @@ from datetime import datetime, timezone
 import mlx as mx
 
 from api.api_models import (
-    ChatResponse,
     GenerateResponse,
     LogprobEntry,
     OllamaMessage,
-    OllamaResponseMessage,
-    OllamaToolCall,
-    OllamaToolCallFunction,
     Tool,
     TopLogprobEntry,
 )
@@ -189,201 +185,6 @@ def build_logprobs(
     return entries
 
 
-async def chat_stream(
-    generator,
-    model_name: str,
-    stats_collector: GenerationStatsCollector,
-    prompt_tokens: list[int],
-    include_logprobs: bool,
-    top_logprobs: int,
-):
-    """
-    Stream chat results as JSON chunks matching Ollama /api/chat format.
-    Uses ChatResponse model for consistent formatting.
-    """
-    full_text = ""
-    thinking = False
-    buffering = None  # None = undecided, True = buffer for tool calls, False = stream
-    pending_chunks = []
-    last_generation_result = None
-
-    try:
-        for generation_result in generator:
-            try:
-                await asyncio.sleep(0)
-            except asyncio.CancelledError:
-                print("Client disconnected, stopping generation")
-                return
-
-            stats_collector.add_tokens(generation_result.tokens)
-            last_generation_result = generation_result
-
-            if generation_result.text:
-                # Partition-based think tag handling
-                text = generation_result.text
-                while text:
-                    if thinking:
-                        if "</think>" in text:
-                            _, _, after = text.partition("</think>")
-                            thinking = False
-                            text = after
-                        else:
-                            text = ""
-                    elif "<think>" in text:
-                        before, _, after = text.partition("<think>")
-                        if before:
-                            full_text += before
-                            if buffering is None:
-                                pending_chunks.append(before)
-                                if any(p in full_text for p in TOOL_CALL_PREFIXES):
-                                    buffering = True
-                                elif len(full_text) >= 15:
-                                    buffering = False
-                                    for c in pending_chunks:
-                                        yield (
-                                            ChatResponse(
-                                                model=model_name,
-                                                created_at=datetime.now(
-                                                    timezone.utc
-                                                ).isoformat(),
-                                                message=OllamaResponseMessage(
-                                                    role="assistant", content=c
-                                                ),
-                                                done=False,
-                                            ).model_dump_json()
-                                            + "\n"
-                                        )
-                                    pending_chunks.clear()
-                            elif buffering is False:
-                                yield (
-                                    ChatResponse(
-                                        model=model_name,
-                                        created_at=datetime.now(
-                                            timezone.utc
-                                        ).isoformat(),
-                                        message=OllamaResponseMessage(
-                                            role="assistant", content=before
-                                        ),
-                                        done=False,
-                                    ).model_dump_json()
-                                    + "\n"
-                                )
-                        thinking = True
-                        text = after
-                    else:
-                        full_text += text
-                        if buffering is None:
-                            pending_chunks.append(text)
-                            if any(p in full_text for p in TOOL_CALL_PREFIXES):
-                                buffering = True
-                            elif len(full_text) >= 15:
-                                buffering = False
-                                for c in pending_chunks:
-                                    yield (
-                                        ChatResponse(
-                                            model=model_name,
-                                            created_at=datetime.now(
-                                                timezone.utc
-                                            ).isoformat(),
-                                            message=OllamaResponseMessage(
-                                                role="assistant", content=c
-                                            ),
-                                            done=False,
-                                        ).model_dump_json()
-                                        + "\n"
-                                    )
-                                pending_chunks.clear()
-                        elif buffering is False:
-                            yield (
-                                ChatResponse(
-                                    model=model_name,
-                                    created_at=datetime.now(timezone.utc).isoformat(),
-                                    message=OllamaResponseMessage(
-                                        role="assistant", content=text
-                                    ),
-                                    done=False,
-                                ).model_dump_json()
-                                + "\n"
-                            )
-                        text = ""
-    except asyncio.CancelledError:
-        print("Client disconnected, stopping generation")
-        return
-
-    # Resolve buffering state if still undecided (very short output)
-    if buffering is None:
-        buffering = any(full_text.startswith(p) for p in TOOL_CALL_PREFIXES)
-        if not buffering:
-            for c in pending_chunks:
-                yield (
-                    ChatResponse(
-                        model=model_name,
-                        created_at=datetime.now(timezone.utc).isoformat(),
-                        message=OllamaResponseMessage(role="assistant", content=c),
-                        done=False,
-                    ).model_dump_json()
-                    + "\n"
-                )
-
-    # Determine done_reason and handle tool calls
-    done_reason = "stop"
-    if last_generation_result and last_generation_result.stop_condition:
-        done_reason = last_generation_result.stop_condition.stop_reason
-
-    tool_calls_out = None
-    content_out = ""
-    if buffering:
-        tool_calls, remaining_content = parse_tool_calls(full_text)
-        if tool_calls:
-            done_reason = "tool_calls"
-            content_out = remaining_content or ""
-            tool_calls_out = [
-                OllamaToolCall(
-                    function=OllamaToolCallFunction(
-                        name=tc.function.name,
-                        arguments=json.loads(tc.function.arguments)
-                        if isinstance(tc.function.arguments, str)
-                        else tc.function.arguments,
-                    )
-                )
-                for tc in tool_calls
-            ]
-        else:
-            content_out = full_text
-
-    # Emit final done=True chunk with stats
-    end_time = time.time()
-    total_time = end_time - stats_collector.start_time
-    final_response = ChatResponse(
-        model=model_name,
-        created_at=datetime.now(timezone.utc).isoformat(),
-        message=OllamaResponseMessage(
-            role="assistant", content=content_out, tool_calls=tool_calls_out
-        ),
-        done=True,
-        done_reason=done_reason,
-        total_duration=int(total_time * 1e9),
-        load_duration=stats_collector.load_duration,
-        prompt_eval_count=len(prompt_tokens),
-        eval_count=stats_collector.total_tokens,
-    )
-    if stats_collector.first_token_time:
-        prompt_time = stats_collector.first_token_time - stats_collector.start_time
-        final_response.prompt_eval_duration = int(prompt_time * 1e9)
-        final_response.eval_duration = int((total_time - prompt_time) * 1e9)
-    if (
-        include_logprobs
-        and last_generation_result
-        and last_generation_result.top_logprobs
-    ):
-        final_response.logprobs = build_logprobs(
-            last_generation_result.tokens,
-            last_generation_result.top_logprobs,
-            top_logprobs,
-        )
-    yield final_response.model_dump_json() + "\n"
-
-
 async def generate_output(
     generator,
     stats_collector: GenerationStatsCollector,
@@ -407,7 +208,11 @@ async def generate_output(
 
         if logprobs_list is not None and generation_result.top_logprobs:
             logprobs_list.extend(
-                build_logprobs(generation_result.tokens, generation_result.top_logprobs)
+                build_logprobs(
+                    generation_result.tokens,
+                    generation_result.top_logprobs,
+                    getattr(generate_query, "top_logprobs", 1) or 1,
+                )
             )
 
     # Thinking process

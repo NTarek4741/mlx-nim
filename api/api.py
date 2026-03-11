@@ -43,10 +43,13 @@ from api.api_models import (
 from api.api_utils import (
     GenerationStatsCollector,
     chat_render,
-    chat_stream,
     generate_output,
     load_and_cache_model,
     model_cache,
+)
+from api.chat_api_utils import (
+    chat_stream,
+    generate_chat_output,
 )
 from api.openai_api_utils import (
     generate_openai_output,
@@ -118,7 +121,7 @@ async def chat(request: Annotated[ChatRequest, Body(examples=CHAT_EXAMPLES)]):
                 )
             )
         else:
-            return await generate_output(
+            return await generate_chat_output(
                 generator, stats_collector, request, prompt_tokens
             )
     except Exception as e:

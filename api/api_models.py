@@ -494,6 +494,16 @@ class ChatCompletionRequest(BaseModel):
         description="Seed for deterministic generation"
     )
 
+    # Log probabilities
+    logprobs: bool | None = Field(
+        default=None,
+        description="Whether to return log probabilities of the output tokens"
+    )
+    top_logprobs: int | None = Field(
+        default=None,
+        description="Number of most likely tokens to return at each position (requires logprobs=true)"
+    )
+
 
 # --- Chat Completion Response (Non-Streaming) ---
 
@@ -505,6 +515,11 @@ class OpenAIResponseMessage(BaseModel):
     tool_calls: list[OpenAIToolCall] | None = None
 
 
+class ChoiceLogprobs(BaseModel):
+    """Log probability information for a choice."""
+    content: list["LogprobEntry"] | None = None
+
+
 class Choice(BaseModel):
     """A completion choice."""
     index: int = Field(description="Index of this choice")
@@ -512,6 +527,10 @@ class Choice(BaseModel):
     finish_reason: Literal["stop", "length", "tool_calls"] | None = Field(
         default=None,
         description="Why generation stopped"
+    )
+    logprobs: ChoiceLogprobs | None = Field(
+        default=None,
+        description="Log probability information for this choice"
     )
 
 

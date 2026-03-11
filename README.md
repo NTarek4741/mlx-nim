@@ -1,6 +1,6 @@
 # mlx-nim
 
-> **Early Stage Project** — Core APIs are functional and under active development. Expect breaking changes between releases.
+> **Early Stage Project** — Core APIs are functional and under active development. 
 
 A local inference server for Apple Silicon Macs. mlx-nim runs language and vision models entirely on-device using Apple's [MLX](https://github.com/ml-explore/mlx) framework, exposing a unified HTTP API that multiple clients and agents can connect to simultaneously — no cloud, no telemetry, no data leaving your machine.
 
@@ -56,10 +56,51 @@ Models are loaded on first request and cached in memory. Subsequent requests to 
 | Streaming | Yes | Yes | Yes |
 | Tool / function calling | Yes | Yes | Yes |
 | Vision (image inputs) | Yes | Yes | Yes |
-| Structured output (JSON schema) | — | — | Yes |
+| Structured output (JSON schema) | Yes | Yes | Yes |
+| Thinking / reasoning blocks | Yes | Yes | —² |
+| Log probabilities | Yes | —¹ | Yes |
 | Speculative decoding | Yes | Yes | Yes |
 | KV cache quantization | Yes | Yes | Yes |
-| Log probabilities | Yes | — | — |
+
+¹ Logprobs are not yet returned by the `/v1/messages` endpoint — the parameter is accepted but the response is not currently wired up to collect them.
+² The Ollama `/api/chat` protocol has no native thinking field in its response format. Thinking content is stripped server-side; use `/v1/chat/completions` or `/v1/messages` to receive reasoning blocks via `reasoning_content`.
+
+---
+
+## Benchmarks
+
+Measured on Apple Silicon with a single server running (dedicated unified memory).
+`pp` = prompt processing speed (tokens/s), `gen` = generation speed (tokens/s).
+MLX-NIM uses MLX 4-bit weights; standard Ollama uses GGUF quantization.
+
+Run your own benchmarks:
+
+```bash
+# MLX-NIM only (stop Ollama first):
+python -m api_tests.speed_test --server mlx
+
+# Standard Ollama only (stop MLX-NIM first):
+python -m api_tests.speed_test --server ollama
+```
+
+### Ministral-3B-Instruct (4-bit, ~1.7 GB)
+
+| Capability | MLX-NIM pp | MLX-NIM gen | Std Ollama pp | Std Ollama gen |
+|-----------|:----------:|:-----------:|:-------------:|:--------------:|
+| Text | ~201 t/s | ~52 t/s | ~85 t/s | ~43 t/s |
+| Vision | ~126 t/s | ~47 t/s | ~342 t/s | ~42 t/s |
+| Tool call | ~501 t/s | ~49 t/s | ~315 t/s¹ | ~46 t/s |
+
+### Qwen3.5-4B (4-bit, thinking model)
+
+| Capability | MLX-NIM pp | MLX-NIM gen | Std Ollama pp | Std Ollama gen |
+|-----------|:----------:|:-----------:|:-------------:|:--------------:|
+| Text | ~123 t/s | ~40 t/s | ~51 t/s | ~19 t/s |
+| Vision | ~7 t/s² | ~40 t/s | ~272 t/s | ~19 t/s |
+| Tool call | ~93 t/s | ~41 t/s | ~285 t/s¹ | ~19 t/s |
+
+¹ Tool call pp for standard Ollama is elevated because the model stays warm from prior requests (KV cache overlap).
+² Qwen vision pp is low because the model immediately emits a long `<think>` preamble; this thinking overhead is counted against prompt processing time in the Ollama timing API.
 
 ---
 
@@ -78,7 +119,12 @@ Models are loaded on first request and cached in memory. Subsequent requests to 
 git clone https://github.com/your-org/mlx-nim
 cd mlx-nim
 uv sync
-source .venv/bin/activate
+```
+
+Use `uv run` to execute commands without activating the virtual environment:
+
+```bash
+uv run uvicorn api.api:app --host 0.0.0.0 --port 1234
 ```
 
 ---
@@ -86,17 +132,26 @@ source .venv/bin/activate
 ## Running the Server
 
 ```bash
-uvicorn api.api:app --host 0.0.0.0 --port 1234
+uv run uvicorn api.api:app --host 0.0.0.0 --port 1234
 ```
 
 The server listens at `http://localhost:1234`. Use `--host 0.0.0.0` to allow connections from other devices on your local network.
+
+### Recommended models
+
+Two models have been fully tested across all endpoints and capabilities:
+
+| Model | Size | Type | HuggingFace ID |
+|-------|------|------|----------------|
+| Ministral-3B-Instruct | ~1.7 GB | Text + Vision + Tools | `mlx-community/Ministral-3-3B-Instruct-2512-4bit` |
+| Qwen3.5-4B | ~2.5 GB | Text + Vision + Tools + Thinking | `qwen/Qwen3.5-4B-MLX-4bit` |
 
 ### Pull a model
 
 ```bash
 curl -X POST http://localhost:1234/api/pull \
   -H "Content-Type: application/json" \
-  -d '{"model": "mlx-community/Llama-3.2-3B-Instruct-4bit"}'
+  -d '{"model": "mlx-community/Ministral-3-3B-Instruct-2512-4bit"}'
 ```
 
 Any MLX-format model directory placed in `./models/` is automatically available without a pull. Browse available models at [huggingface.co/mlx-community](https://huggingface.co/mlx-community).
@@ -113,7 +168,7 @@ Claude Code connects via the Anthropic-compatible `/v1/messages` endpoint. Set t
 export ANTHROPIC_BASE_URL=http://localhost:1234
 export ANTHROPIC_AUTH_TOKEN=local
 
-claude --model mlx-community/Llama-3.2-3B-Instruct-4bit
+claude --model mlx-community/Ministral-3-3B-Instruct-2512-4bit
 ```
 
 > Coding agents consume context aggressively. Use a model with at least 25k context length — 4-bit quantized 7B+ models are a practical starting point.
@@ -137,8 +192,8 @@ Edit `~/.config/opencode/opencode.json`:
         "baseURL": "http://localhost:1234/v1"
       },
       "models": {
-        "mlx-community/Llama-3.2-3B-Instruct-4bit": {
-          "name": "mlx-community/Llama-3.2-3B-Instruct-4bit"
+        "mlx-community/Ministral-3-3B-Instruct-2512-4bit": {
+          "name": "mlx-community/Ministral-3-3B-Instruct-2512-4bit"
         }
       }
     }
@@ -178,7 +233,7 @@ Connect n8n workflows to mlx-nim using an **HTTP Request** node targeting the Op
 
 ```json
 {
-  "model": "mlx-community/Llama-3.2-3B-Instruct-4bit",
+  "model": "mlx-community/Ministral-3-3B-Instruct-2512-4bit",
   "messages": [
     { "role": "system", "content": "You are a helpful assistant." },
     { "role": "user", "content": "{{ $json.prompt }}" }
@@ -193,13 +248,40 @@ Set `"stream": true` for streaming workflows and configure your n8n flow to hand
 
 ## API Reference
 
+### Ollama-compatible chat
+
+```bash
+curl http://localhost:1234/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/Ministral-3-3B-Instruct-2512-4bit",
+    "messages": [
+      {"role": "system", "content": "You are a helpful assistant."},
+      {"role": "user", "content": "Explain KV cache quantization in one paragraph."}
+    ],
+    "stream": false
+  }'
+```
+
+Or using the [Ollama Python SDK](https://github.com/ollama/ollama-python):
+
+```python
+import ollama
+client = ollama.Client(host="http://localhost:1234")
+resp = client.chat(
+    model="mlx-community/Ministral-3-3B-Instruct-2512-4bit",
+    messages=[{"role": "user", "content": "Explain KV cache quantization in one paragraph."}],
+)
+print(resp.message.content)
+```
+
 ### OpenAI-compatible chat completion
 
 ```bash
 curl http://localhost:1234/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "mlx-community/Llama-3.2-3B-Instruct-4bit",
+    "model": "mlx-community/Ministral-3-3B-Instruct-2512-4bit",
     "messages": [
       {"role": "system", "content": "You are a helpful assistant."},
       {"role": "user", "content": "Explain KV cache quantization in one paragraph."}
@@ -216,7 +298,7 @@ curl http://localhost:1234/v1/messages \
   -H "Content-Type: application/json" \
   -H "x-api-key: local" \
   -d '{
-    "model": "mlx-community/Llama-3.2-3B-Instruct-4bit",
+    "model": "mlx-community/Ministral-3-3B-Instruct-2512-4bit",
     "max_tokens": 1024,
     "messages": [
       {"role": "user", "content": "Explain KV cache quantization in one paragraph."}
