@@ -1,11 +1,14 @@
 import asyncio
 import gc
 import json
+import logging
 import re
 import time
 from datetime import datetime, timezone
 
 import mlx as mx
+
+logger = logging.getLogger(__name__)
 
 from api.api_models import (
     GenerateResponse,
@@ -45,7 +48,7 @@ def load_and_cache_model(
     }
     # Load Model from cache or clear cache if new load params requested
     if model_cache.get("load_params") == load_params:
-        print("Model already loaded ✓", end="\n", flush=True)
+        logger.info(f"[LOAD] Model cached — {load_params['model_path']}")
         return model_cache.get("model_kit"), 0  # No load time for cached model
     else:
         if model_cache.get("model_kit") is not None:
@@ -53,14 +56,10 @@ def load_and_cache_model(
             del model_cache["load_params"]
             mx.core.clear_cache()
             gc.collect()
-            print(
-                "New Model Requetsted, Previous Model cleared from Cache ✓",
-                end="\n",
-                flush=True,
-            )
+            logger.info("[LOAD] Previous model cleared from cache")
 
     load_start_time = time.time()
-    print("Loading model...", end="\n", flush=True)
+    logger.info(f"[LOAD] Loading {load_params['model_path']}...")
     model_kit = load_model(
         load_params["model_path"],
         max_kv_size=load_params["max_kv_size"],
@@ -70,26 +69,22 @@ def load_and_cache_model(
         kv_group_size=load_params["kv_group_size"],
         quantized_kv_start=load_params["quantized_kv_start"],
     )
-    print("\rModel load complete ✓", end="\n", flush=True)
 
     # Load draft model if specified
     if load_params["draft_model"]:
-        print(
-            f"Loading draft model: {load_params['draft_model']}...",
-            end="\n",
-            flush=True,
-        )
+        logger.info(f"[LOAD] Loading draft model: {load_params['draft_model']}...")
         load_draft_model(model_kit, load_params["draft_model"])
-        print("Draft model loaded ✓", end="\n", flush=True)
+        logger.info("[LOAD] Draft model loaded")
 
     load_end_time = time.time()
     load_duration_ns = int((load_end_time - load_start_time) * 1e9)
+    elapsed = load_end_time - load_start_time
 
     # Update cache
     model_cache["model_kit"] = model_kit
     model_cache["load_params"] = load_params
 
-    print("✅ Model ready for inference!", end="\n", flush=True)
+    logger.info(f"[LOAD] Model ready in {elapsed:.2f}s — {load_params['model_path']}")
     return model_kit, load_duration_ns
 
 
@@ -120,7 +115,7 @@ class GenerationStatsCollector:
 
         # Check if first token was generated
         if self.first_token_time is None:
-            print("\n\nNo tokens generated")
+            logger.warning("[STATS] No tokens generated")
             return
 
         time_to_first_token = self.first_token_time - self.start_time
@@ -128,15 +123,8 @@ class GenerationStatsCollector:
         tokens_per_second = (
             self.total_tokens / effective_time if effective_time > 0 else float("inf")
         )
-        print("\n\nGeneration stats:")
-        print(f" - Tokens per second: {tokens_per_second:.2f}")
-        if self.num_accepted_draft_tokens is not None:
-            print(
-                f" - Number of accepted draft tokens: {self.num_accepted_draft_tokens}"
-            )
-        print(f" - Time to first token: {time_to_first_token:.2f}s")
-        print(f" - Total tokens generated: {self.total_tokens}")
-        print(f" - Total time: {total_time:.2f}s")
+        logger.info(f"[STATS] tokens/s={tokens_per_second:.2f} ttft={time_to_first_token:.2f}s total={self.total_tokens} elapsed={total_time:.2f}s"
+                    + (f" draft_accepted={self.num_accepted_draft_tokens}" if self.num_accepted_draft_tokens is not None else ""))
 
     def get_tokens_per_second(self):
         """Calculate and return tokens per second."""
@@ -280,6 +268,7 @@ async def generate_output(
 async def chat_render(
     messages: list[OllamaMessage], tools: list[Tool] | None, images: list[str]
 ):
+    logger.info(f"[RENDER] Applying template — {len(messages)} messages, tools={tools is not None}, images={len(images)}")
     tf_tokenizer = model_cache["model_kit"].tokenizer._tokenizer
 
     # Convert Pydantic models to dicts and collect images
@@ -321,5 +310,8 @@ async def chat_render(
     prompt = tf_tokenizer.apply_chat_template(
         messages_dicts, tools=tools_dicts, tokenize=False, add_generation_prompt=True
     )
-    return tokenize(model_cache["model_kit"], prompt)
+    logger.debug(f"[RENDER] Prompt tail: {repr(prompt[-200:])}")
+    tokens = tokenize(model_cache["model_kit"], prompt)
+    logger.info(f"[RENDER] Tokenized → {len(tokens)} prompt tokens")
+    return tokens
 

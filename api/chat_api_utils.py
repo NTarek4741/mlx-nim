@@ -1,8 +1,11 @@
 import asyncio
 import json
+import logging
 import re
 import time
 from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
 
 from api.api_models import (
     ChatRequest,
@@ -142,17 +145,27 @@ async def chat_stream(
     buffering = None  # None = undecided, True = buffer for tool calls, False = stream
     pending_chunks = []
     last_generation_result = None
+    token_count = 0
+    stream_start = time.time()
+    first_token_logged = False
+
+    logger.info("[CHAT_STREAM] Start")
 
     try:
         for generation_result in generator:
             try:
                 await asyncio.sleep(0)
             except asyncio.CancelledError:
-                print("Client disconnected, stopping generation")
+                logger.warning(f"[CHAT_STREAM] Client disconnected after {token_count} tokens")
                 return
 
             stats_collector.add_tokens(generation_result.tokens)
+            token_count += len(generation_result.tokens)
             last_generation_result = generation_result
+
+            if not first_token_logged and generation_result.text:
+                logger.info(f"[CHAT_STREAM] First token in {time.time() - stream_start:.3f}s")
+                first_token_logged = True
 
             if generation_result.text:
                 # Partition-based think tag handling
@@ -243,7 +256,7 @@ async def chat_stream(
                             )
                         text = ""
     except asyncio.CancelledError:
-        print("Client disconnected, stopping generation")
+        logger.warning(f"[CHAT_STREAM] Client disconnected after {token_count} tokens")
         return
 
     # Resolve buffering state if still undecided (very short output)
@@ -315,4 +328,5 @@ async def chat_stream(
             last_generation_result.top_logprobs,
             top_logprobs,
         )
+    logger.info(f"[CHAT_STREAM] Done — {token_count} tokens in {time.time() - stream_start:.2f}s")
     yield final_response.model_dump_json() + "\n"

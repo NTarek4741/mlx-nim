@@ -1,8 +1,12 @@
 import asyncio
 import json
+import logging
 import re
+import time
 import uuid
 from typing import AsyncGenerator
+
+logger = logging.getLogger(__name__)
 
 from api.api_models import (
     AnthropicMessageResponse,
@@ -315,6 +319,11 @@ async def anthropic_stream(
     - message_stop
     """
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
+    token_count = 0
+    stream_start = time.time()
+    first_token_logged = False
+
+    logger.info(f"[ANTHROPIC_STREAM] Start — model={model_name}")
 
     # 1. message_start event
     message_start = {
@@ -351,6 +360,15 @@ async def anthropic_stream(
                 return
 
             stats_collector.add_tokens(generation_result.tokens)
+            token_count += len(generation_result.tokens)
+
+            if generation_result.text and not first_token_logged:
+                logger.info(f"[ANTHROPIC_STREAM] First token in {time.time() - stream_start:.3f}s")
+                first_token_logged = True
+
+            if generation_result.stop_condition:
+                sr = generation_result.stop_condition.stop_reason
+                logger.info(f"[ANTHROPIC_STREAM] Stop — {sr}")
 
             if generation_result.text:
                 # Partition-based think tag handling — processes content on both sides of tag boundaries
@@ -436,6 +454,7 @@ async def anthropic_stream(
                     stop_reason = "max_tokens"
                 break
     except asyncio.CancelledError:
+        logger.warning(f"[ANTHROPIC_STREAM] Client disconnected after {token_count} tokens")
         return
 
     # Close any open thinking block (model stopped mid-think)
@@ -502,6 +521,7 @@ async def anthropic_stream(
     yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason or 'end_turn', 'stop_sequence': None}, 'usage': {'output_tokens': stats_collector.total_tokens}})}\n\n"
 
     # message_stop
+    logger.info(f"[ANTHROPIC_STREAM] Done — {token_count} tokens in {time.time() - stream_start:.2f}s")
     yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
 
 

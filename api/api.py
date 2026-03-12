@@ -1,3 +1,4 @@
+import asyncio
 import gc
 import hashlib
 import json
@@ -73,6 +74,20 @@ logging.basicConfig(
 app = FastAPI()
 logger = logging.getLogger(__name__)
 
+# Serializes all engine_core calls + their full response lifecycle.
+# MLX runs on one device; concurrent generation corrupts shared model state.
+engine_lock = asyncio.Lock()
+
+
+async def _locked_stream(gen, lock):
+    """Wrap an async generator, releasing lock when it finishes or errors."""
+    try:
+        async for chunk in gen:
+            yield chunk
+    finally:
+        lock.release()
+        logger.info("[LOCK] Released")
+
 
 # POST - Generate a chat message
 @app.post("/api/chat")
@@ -98,19 +113,25 @@ async def chat(request: Annotated[ChatRequest, Body(examples=CHAT_EXAMPLES)]):
             or a dictionary containing the complete chat response with message content
             and generation statistics.
     """
+    logger.info(f"→ /api/chat model={request.model} stream={request.stream} messages={len(request.messages)}")
     options = request.options or GenerationOptions()
 
+    logger.info(f"[LOCK] Waiting to acquire for {request.model}")
+    await engine_lock.acquire()
+    logger.info("[LOCK] Acquired")
     try:
         generator, stats_collector, prompt_tokens = await engine_core(
             options, request.model, request
         )
     except Exception as e:
+        engine_lock.release()
+        logger.info("[LOCK] Released (error)")
         logger.info(f"Error Occured: {str(e)}")
         return {"error": f"Error Occured: {str(e)}"}
 
-    try:
-        if request.stream:
-            return StreamingResponse(
+    if request.stream:
+        return StreamingResponse(
+            _locked_stream(
                 chat_stream(
                     generator,
                     request.model,
@@ -118,18 +139,25 @@ async def chat(request: Annotated[ChatRequest, Body(examples=CHAT_EXAMPLES)]):
                     prompt_tokens,
                     request.logprobs,
                     request.top_logprobs,
-                )
+                ),
+                engine_lock,
             )
-        else:
+        )
+    else:
+        try:
             return await generate_chat_output(
                 generator, stats_collector, request, prompt_tokens
             )
-    except Exception as e:
-        logger.info(f"Error while generating chat response: {str(e)}")
-        raise e
+        except Exception as e:
+            logger.info(f"Error while generating chat response: {str(e)}")
+            raise e
+        finally:
+            engine_lock.release()
+            logger.info("[LOCK] Released")
 
 
 async def engine_core(options, model_name, request):
+    logger.info(f"[ENGINE] Loading model {model_name}")
     try:
         model_kit, load_duration_ns = load_and_cache_model(
             model=model_name,
@@ -143,6 +171,12 @@ async def engine_core(options, model_name, request):
         logger.info(f"Error while loading: {str(e)}")
         raise e
 
+    if load_duration_ns == 0:
+        logger.info("[ENGINE] Model cached — skipping load")
+    else:
+        logger.info(f"[ENGINE] Model loaded in {load_duration_ns / 1e9:.2f}s")
+
+    logger.info(f"[ENGINE] Rendering {len(request.messages)} messages")
     try:
         images = []
         prompt_tokens = await chat_render(request.messages, request.tools, images)
@@ -178,6 +212,8 @@ async def engine_core(options, model_name, request):
     except Exception as e:
         logger.info(f"Error creating generator: {str(e)}")
         raise e
+
+    logger.info(f"[ENGINE] Generator created — {len(prompt_tokens)} prompt tokens")
     return generator, stats_collector, prompt_tokens
 
 
@@ -235,18 +271,29 @@ async def messages(params: Annotated[MessagesParams, Body(examples=MESSAGES_EXAM
             or a dictionary containing the complete message response with content,
             usage statistics, and stop reason.
     """
-    try:
-        # 1. Convert Anthropic params to ChatRequest
-        request = anthropic_to_chat_convert(params)
+    logger.info(f"→ /v1/messages model={params.model} stream={params.stream} messages={len(params.messages)}")
 
-        # 2. Run through engine_core (same pattern as OpenAI)
+    # 1. Convert Anthropic params to ChatRequest
+    request = anthropic_to_chat_convert(params)
+
+    # 2. Run through engine_core (same pattern as OpenAI)
+    logger.info(f"[LOCK] Waiting to acquire for {params.model}")
+    await engine_lock.acquire()
+    logger.info("[LOCK] Acquired")
+    try:
         generator, stats_collector, prompt_tokens = await engine_core(
             request.options, params.model, request
         )
+    except Exception as e:
+        engine_lock.release()
+        logger.info("[LOCK] Released (error)")
+        logger.info(f"Error processing Anthropic messages request: {str(e)}")
+        return {"error": f"Error processing messages request: {str(e)}"}
 
-        # 3. Return Anthropic-format response
-        if params.stream:
-            return StreamingResponse(
+    # 3. Return Anthropic-format response
+    if params.stream:
+        return StreamingResponse(
+            _locked_stream(
                 anthropic_stream(
                     generator,
                     params.model,
@@ -255,18 +302,24 @@ async def messages(params: Annotated[MessagesParams, Body(examples=MESSAGES_EXAM
                     params.top_logprobs > 0 if params.top_logprobs else False,
                     params.top_logprobs or 0,
                 ),
-                media_type="text/event-stream",
-            )
-        else:
+                engine_lock,
+            ),
+            media_type="text/event-stream",
+        )
+    else:
+        try:
             return await generate_anthropic_output(
                 generator,
                 stats_collector,
                 params,
                 len(prompt_tokens),
             )
-    except Exception as e:
-        logger.info(f"Error processing Anthropic messages request: {str(e)}")
-        return {"error": f"Error processing messages request: {str(e)}"}
+        except Exception as e:
+            logger.info(f"Error processing Anthropic messages request: {str(e)}")
+            return {"error": f"Error processing messages request: {str(e)}"}
+        finally:
+            engine_lock.release()
+            logger.info("[LOCK] Released")
 
 
 # =============================================================================
@@ -300,34 +353,50 @@ async def chat_completions(
             or a dictionary containing the complete chat completion with choices,
             usage statistics, and finish reason.
     """
+    logger.info(f"→ /v1/chat/completions model={params.model} stream={params.stream} messages={len(params.messages)}")
     request = openai_to_chat_convert(params)
-    generator, stats_collector, prompt_tokens = await engine_core(
-        request.options, params.model, request
-    )
 
-    # 8. Return streaming or non-streaming response
+    logger.info(f"[LOCK] Waiting to acquire for {params.model}")
+    await engine_lock.acquire()
+    logger.info("[LOCK] Acquired")
+    try:
+        generator, stats_collector, prompt_tokens = await engine_core(
+            request.options, params.model, request
+        )
+    except Exception:
+        engine_lock.release()
+        logger.info("[LOCK] Released (error)")
+        raise
+
     if params.stream:
         include_usage = False
         if params.stream_options and params.stream_options.include_usage:
             include_usage = True
 
         return StreamingResponse(
-            openai_stream(
-                generator,
-                params.model,
-                stats_collector,
-                prompt_tokens,
-                include_usage,
+            _locked_stream(
+                openai_stream(
+                    generator,
+                    params.model,
+                    stats_collector,
+                    prompt_tokens,
+                    include_usage,
+                ),
+                engine_lock,
             ),
             media_type="text/event-stream",
         )
     else:
-        return await generate_openai_output(
-            generator,
-            stats_collector,
-            params,
-            len(prompt_tokens),
-        )
+        try:
+            return await generate_openai_output(
+                generator,
+                stats_collector,
+                params,
+                len(prompt_tokens),
+            )
+        finally:
+            engine_lock.release()
+            logger.info("[LOCK] Released")
 
 
 # =============================================================================

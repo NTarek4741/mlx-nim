@@ -1,11 +1,14 @@
 import asyncio
 import base64
 import json
+import logging
 import re
 import time
 import uuid
 from typing import AsyncGenerator
 from urllib.request import urlopen
+
+logger = logging.getLogger(__name__)
 
 from api.api_models import (
     ChatCompletionRequest,
@@ -252,6 +255,11 @@ async def openai_stream(
     tool_format = None  # "xml" or "mistral"
     chunk_id = str(uuid.uuid4())
     created = int(time.time())
+    token_count = 0
+    stream_start = time.time()
+    first_token_logged = False
+
+    logger.info(f"[OPENAI_STREAM] Start — model={model_name}")
 
     def make_chunk(delta: dict) -> str:
         return f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_name, 'choices': [{'index': 0, 'delta': delta, 'logprobs': None, 'finish_reason': None}]})}\n\n"
@@ -260,14 +268,25 @@ async def openai_stream(
         try:
             await asyncio.sleep(0)
         except asyncio.CancelledError:
+            logger.warning(f"[OPENAI_STREAM] Client disconnected after {token_count} tokens")
             return
 
         stats_collector.add_tokens(generation_result.tokens)
+        token_count += len(generation_result.tokens)
+
+        if generation_result.stop_condition:
+            logger.info(f"[OPENAI_STREAM] Stop — {generation_result.stop_condition.stop_reason}")
 
         if generation_result.text:
             text = re.sub(r'<\|im_(start|end)\|>', '', generation_result.text)
             if not text:
                 continue
+
+            if not first_token_logged:
+                logger.info(f"[OPENAI_STREAM] First token in {time.time() - stream_start:.3f}s")
+                first_token_logged = True
+            if token_count <= 5:
+                logger.debug(f"[OPENAI_STREAM] token#{token_count}: {repr(text[:60])}")
 
             if "<think>" in text:
                 thinking = True
@@ -283,6 +302,7 @@ async def openai_stream(
                 calling_tool = False
                 for chunk in parse_tool(tool_call, model_name, chunk_id, created):
                     yield chunk
+                logger.info(f"[OPENAI_STREAM] Done (tool_call) — {token_count} tokens in {time.time() - stream_start:.2f}s")
                 return
             if calling_tool:
                 tool_call += text
@@ -294,9 +314,10 @@ async def openai_stream(
                 yield make_chunk({"content": text})
 
     if tool_call and "[TOOL_CALLS]" in tool_call:
-        print(tool_call)
+        logger.debug(f"[OPENAI_STREAM] Flushing buffered tool call")
         for chunk in parse_tool(tool_call, model_name, chunk_id, created):
             yield chunk
+        logger.info(f"[OPENAI_STREAM] Done (tool_call) — {token_count} tokens in {time.time() - stream_start:.2f}s")
         return
 
     stop_chunk = {
@@ -308,6 +329,7 @@ async def openai_stream(
     }
     yield f"data: {json.dumps(stop_chunk)}\n\n"
     yield "data: [DONE]\n\n"
+    logger.info(f"[OPENAI_STREAM] Done — {token_count} tokens in {time.time() - stream_start:.2f}s")
 
 
 async def generate_openai_output(
