@@ -223,6 +223,19 @@ def parse_tool(text: str, model_name: str, chunk_id: str, created: int) -> list[
                 params = json.loads(match.group(2))
             except json.JSONDecodeError:
                 pass
+    elif "<|tool_call_start|>" in text:
+        function_name = ""
+        params = {}
+        match = re.search(r'<\|tool_call_start\|>(.*?)<\|tool_call_end\|>', text, re.DOTALL)
+        if match:
+            call_content = match.group(1).strip()
+            func_match = re.match(r'(\w+)\s*\(', call_content)
+            function_name = func_match.group(1) if func_match else ""
+            for pm in re.finditer(r'(\w+)=("(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\')', call_content):
+                key = pm.group(1)
+                val = pm.group(2)[1:-1]
+                val = val.replace('\\"', '"').replace("\\'", "'")
+                params[key] = val
 
     base = {
         "id": chunk_id,
@@ -295,9 +308,9 @@ async def openai_stream(
                 thinking = False
                 text = text.replace("</think>", "")
 
-            if "<tool_call>" in text or "[TOOL_CALLS]" in text:
+            if "<tool_call>" in text or "[TOOL_CALLS]" in text or "<|tool_call_start|>" in text:
                 calling_tool = True
-            if "</tool_call>" in text:
+            if "</tool_call>" in text or "<|tool_call_end|>" in text:
                 tool_call += text
                 calling_tool = False
                 for chunk in parse_tool(tool_call, model_name, chunk_id, created):

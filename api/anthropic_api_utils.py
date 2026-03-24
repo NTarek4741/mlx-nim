@@ -37,7 +37,7 @@ from api.openai_api_utils import image_url_to_base64
 # Anthropic Utility Functions
 # =============================================================================
 
-TOOL_CALL_PREFIXES = ["<tool_call>", "[TOOL_CALLS]"]
+TOOL_CALL_PREFIXES = ["<tool_call>", "[TOOL_CALLS]", "<|tool_call_start|>"]
 
 
 def parse_tool_calls(text: str) -> tuple[list[AnthropicToolUseBlock] | None, str]:
@@ -64,6 +64,20 @@ def parse_tool_calls(text: str) -> tuple[list[AnthropicToolUseBlock] | None, str
             except json.JSONDecodeError:
                 pass
         remaining = re.sub(r'\[TOOL_CALLS\].*', '', text, flags=re.DOTALL).strip()
+    elif "<|tool_call_start|>" in text:
+        match = re.search(r'<\|tool_call_start\|>(.*?)<\|tool_call_end\|>', text, re.DOTALL)
+        if not match:
+            return None, text
+        call_content = match.group(1).strip()
+        func_match = re.match(r'(\w+)\s*\(', call_content)
+        function_name = func_match.group(1) if func_match else ""
+        params = {}
+        for pm in re.finditer(r'(\w+)=("(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\')', call_content):
+            key = pm.group(1)
+            val = pm.group(2)[1:-1]
+            val = val.replace('\\"', '"').replace("\\'", "'")
+            params[key] = val
+        remaining = re.sub(r'<\|tool_call_start\|>.*?<\|tool_call_end\|>', '', text, flags=re.DOTALL).strip()
     else:
         return None, text
 
